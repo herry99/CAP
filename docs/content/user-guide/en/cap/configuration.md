@@ -39,7 +39,7 @@ The default consumer group name, corresponding to different names in different T
 
 !!! info "Mapping"
     Map to [Queue Names](https://www.rabbitmq.com/queues.html#names) in RabbitMQ.  
-    Map to Topic Name in Apache Kafka.  
+    Map to [Consumer Group Id](http://kafka.apache.org/documentation/#group.id) in Apache Kafka.  
     Map to Subscription Name in Azure Service Bus.  
 
 #### Version
@@ -70,6 +70,12 @@ In the process of message consumption failed, the CAP will retry to execute. Thi
 !!! WARNING "Retry & Interval"
     By default, retry will start after **4 minutes** of failure to send or consume, in order to avoid possible problems caused by setting message state delays.    
     Failures in the process of sending and consuming messages will be retried 3 times immediately, and will be retried polling after 3 times, at which point the FailedRetryInterval configuration will take effect.
+
+#### ConsumerThreadCount 
+
+> Default : 1
+
+Number of consumer threads, when this value is greater than 1, the order of message execution cannot be guaranteed
 
 #### FailedRetryCount
 

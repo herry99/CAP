@@ -3,13 +3,13 @@
 
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Linq;
-using Dapper;
-using DotNetCore.CAP.Dashboard;
-using DotNetCore.CAP.Dashboard.Monitoring;
-using DotNetCore.CAP.Infrastructure;
-using DotNetCore.CAP.Models;
+using System.Threading.Tasks;
+using DotNetCore.CAP.Internal;
+using DotNetCore.CAP.Messages;
+using DotNetCore.CAP.Monitoring;
+using DotNetCore.CAP.Persistence;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 
 namespace DotNetCore.CAP.SqlServer
@@ -17,136 +17,155 @@ namespace DotNetCore.CAP.SqlServer
     internal class SqlServerMonitoringApi : IMonitoringApi
     {
         private readonly SqlServerOptions _options;
-        private readonly SqlServerStorage _storage;
+        private readonly string _pubName;
+        private readonly string _recName;
 
-        public SqlServerMonitoringApi(IStorage storage, IOptions<SqlServerOptions> options)
+        public SqlServerMonitoringApi(IOptions<SqlServerOptions> options, IStorageInitializer initializer)
         {
             _options = options.Value ?? throw new ArgumentNullException(nameof(options));
-            _storage = storage as SqlServerStorage ?? throw new ArgumentNullException(nameof(storage));
+            _pubName = initializer.GetPublishedTableName();
+            _recName = initializer.GetReceivedTableName();
         }
 
         public StatisticsDto GetStatistics()
         {
-            var sql = string.Format(@"
-set transaction isolation level read committed;
-select count(Id) from [{0}].Published with (nolock) where StatusName = N'Succeeded';
-select count(Id) from [{0}].Received with (nolock) where StatusName = N'Succeeded';
-select count(Id) from [{0}].Published with (nolock) where StatusName = N'Failed';
-select count(Id) from [{0}].Received with (nolock) where StatusName = N'Failed';",
-                _options.Schema);
+            var sql = $@"
+SELECT
+(
+    SELECT COUNT(Id) FROM {_pubName} WHERE StatusName = N'Succeeded'
+) AS PublishedSucceeded,
+(
+    SELECT COUNT(Id) FROM {_recName} WHERE StatusName = N'Succeeded'
+) AS ReceivedSucceeded,
+(
+    SELECT COUNT(Id) FROM {_pubName} WHERE StatusName = N'Failed'
+) AS PublishedFailed,
+(
+    SELECT COUNT(Id) FROM {_recName} WHERE StatusName = N'Failed'
+) AS ReceivedFailed;";
 
-            var statistics = UseConnection(connection =>
+            using var connection = new SqlConnection(_options.ConnectionString);
+            var statistics = connection.ExecuteReader(sql, reader =>
             {
-                var stats = new StatisticsDto();
-                using (var multi = connection.QueryMultiple(sql))
-                {
-                    stats.PublishedSucceeded = multi.ReadSingle<int>();
-                    stats.ReceivedSucceeded = multi.ReadSingle<int>();
+                var statisticsDto = new StatisticsDto();
 
-                    stats.PublishedFailed = multi.ReadSingle<int>();
-                    stats.ReceivedFailed = multi.ReadSingle<int>();
+                while (reader.Read())
+                {
+                    statisticsDto.PublishedSucceeded = reader.GetInt32(0);
+                    statisticsDto.ReceivedSucceeded = reader.GetInt32(1);
+                    statisticsDto.PublishedFailed = reader.GetInt32(2);
+                    statisticsDto.ReceivedFailed = reader.GetInt32(3);
                 }
 
-                return stats;
+                return statisticsDto;
             });
+
             return statistics;
         }
 
         public IDictionary<DateTime, int> HourlyFailedJobs(MessageType type)
         {
-            var tableName = type == MessageType.Publish ? "Published" : "Received";
-            return UseConnection(connection =>
-                GetHourlyTimelineStats(connection, tableName, StatusName.Failed));
+            var tableName = type == MessageType.Publish ? _pubName : _recName;
+            return GetHourlyTimelineStats(tableName, nameof(StatusName.Failed));
         }
 
         public IDictionary<DateTime, int> HourlySucceededJobs(MessageType type)
         {
-            var tableName = type == MessageType.Publish ? "Published" : "Received";
-            return UseConnection(connection =>
-                GetHourlyTimelineStats(connection, tableName, StatusName.Succeeded));
+            var tableName = type == MessageType.Publish ? _pubName : _recName;
+            return GetHourlyTimelineStats(tableName, nameof(StatusName.Succeeded));
         }
 
         public IList<MessageDto> Messages(MessageQueryDto queryDto)
         {
-            var tableName = queryDto.MessageType == MessageType.Publish ? "Published" : "Received";
+            var tableName = queryDto.MessageType == MessageType.Publish ? _pubName : _recName;
             var where = string.Empty;
-            if (!string.IsNullOrEmpty(queryDto.StatusName))
-            {
-                where += " and statusname=@StatusName";
-            }
+            if (!string.IsNullOrEmpty(queryDto.StatusName)) where += " and statusname=@StatusName";
 
-            if (!string.IsNullOrEmpty(queryDto.Name))
-            {
-                where += " and name=@Name";
-            }
+            if (!string.IsNullOrEmpty(queryDto.Name)) where += " and name=@Name";
 
-            if (!string.IsNullOrEmpty(queryDto.Group))
-            {
-                where += " and [group]=@Group";
-            }
+            if (!string.IsNullOrEmpty(queryDto.Group)) where += " and [group]=@Group";
 
-            if (!string.IsNullOrEmpty(queryDto.Content))
-            {
-                where += " and content like '%@Content%'";
-            }
+            if (!string.IsNullOrEmpty(queryDto.Content)) where += " and content like @Content";
 
             var sqlQuery2008 =
                 $@"select * from 
-                (SELECT t.*, ROW_NUMBER() OVER(order by t.Added desc) AS rownumber
-                    from [{_options.Schema}].{tableName} as t
+                (SELECT t.*, ROW_NUMBER() OVER(order by t.Added desc) AS row_number
+                    from {tableName} as t
                     where 1=1 {where}) as tbl
-                where tbl.rownumber between @offset and @offset + @limit";
+                where tbl.row_number between @offset and @offset + @limit";
 
             var sqlQuery =
-                $"select * from [{_options.Schema}].{tableName} where 1=1 {where} order by Added desc offset @Offset rows fetch next @Limit rows only";
+                $"select * from {tableName} where 1=1 {where} order by Added desc offset @Offset rows fetch next @Limit rows only";
 
-            return UseConnection(conn => conn.Query<MessageDto>(_options.IsSqlServer2008 ? sqlQuery2008 : sqlQuery, new
+            object[] sqlParams =
             {
-                queryDto.StatusName,
-                queryDto.Group,
-                queryDto.Name,
-                queryDto.Content,
-                Offset = queryDto.CurrentPage * queryDto.PageSize,
-                Limit = queryDto.PageSize
-            }).ToList());
+                new SqlParameter("@StatusName", queryDto.StatusName ?? string.Empty),
+                new SqlParameter("@Group", queryDto.Group ?? string.Empty),
+                new SqlParameter("@Name", queryDto.Name ?? string.Empty),
+                new SqlParameter("@Content", $"%{queryDto.Content}%"),
+                new SqlParameter("@Offset", queryDto.CurrentPage * queryDto.PageSize),
+                new SqlParameter("@Limit", queryDto.PageSize)
+            };
+
+            using var connection = new SqlConnection(_options.ConnectionString);
+            return connection.ExecuteReader(_options.IsSqlServer2008 ? sqlQuery2008 : sqlQuery, reader =>
+            {
+                var messages = new List<MessageDto>();
+
+                while (reader.Read())
+                {
+                    var index = 0;
+                    messages.Add(new MessageDto
+                    {
+                        Id = reader.GetInt64(index++),
+                        Version = reader.GetString(index++),
+                        Group = queryDto.MessageType == MessageType.Subscribe ? reader.GetString(index++) : default,
+                        Name = reader.GetString(index++),
+                        Content = reader.GetString(index++),
+                        Retries = reader.GetInt32(index++),
+                        Added = reader.GetDateTime(index++),
+                        ExpiresAt = reader.GetDateTime(index++),
+                        StatusName = reader.GetString(index)
+                    });
+                }
+
+                return messages;
+            }, sqlParams);
         }
 
         public int PublishedFailedCount()
         {
-            return UseConnection(conn => GetNumberOfMessage(conn, "Published", StatusName.Failed));
+            return GetNumberOfMessage(_pubName, nameof(StatusName.Failed));
         }
 
         public int PublishedSucceededCount()
         {
-            return UseConnection(conn => GetNumberOfMessage(conn, "Published", StatusName.Succeeded));
+            return GetNumberOfMessage(_pubName, nameof(StatusName.Succeeded));
         }
 
         public int ReceivedFailedCount()
         {
-            return UseConnection(conn => GetNumberOfMessage(conn, "Received", StatusName.Failed));
+            return GetNumberOfMessage(_recName, nameof(StatusName.Failed));
         }
 
         public int ReceivedSucceededCount()
         {
-            return UseConnection(conn => GetNumberOfMessage(conn, "Received", StatusName.Succeeded));
+            return GetNumberOfMessage(_recName, nameof(StatusName.Succeeded));
         }
 
-        private int GetNumberOfMessage(IDbConnection connection, string tableName, string statusName)
+        public async Task<MediumMessage> GetPublishedMessageAsync(long id) => await GetMessageAsync(_pubName, id);
+
+        public async Task<MediumMessage> GetReceivedMessageAsync(long id) => await GetMessageAsync(_recName, id);
+
+        private int GetNumberOfMessage(string tableName, string statusName)
         {
             var sqlQuery =
-                $"select count(Id) from [{_options.Schema}].{tableName} with (nolock) where StatusName = @state";
-
-            var count = connection.ExecuteScalar<int>(sqlQuery, new {state = statusName});
-            return count;
+                $"select count(Id) from {tableName} with (nolock) where StatusName = @state";
+            using var connection = new SqlConnection(_options.ConnectionString);
+            return connection.ExecuteScalar<int>(sqlQuery, new SqlParameter("@state", statusName));
         }
 
-        private T UseConnection<T>(Func<IDbConnection, T> action)
-        {
-            return _storage.UseConnection(action);
-        }
-
-        private Dictionary<DateTime, int> GetHourlyTimelineStats(IDbConnection connection, string tableName,
-            string statusName)
+        private Dictionary<DateTime, int> GetHourlyTimelineStats(string tableName, string statusName)
         {
             var endDate = DateTime.Now;
             var dates = new List<DateTime>();
@@ -158,11 +177,10 @@ select count(Id) from [{0}].Received with (nolock) where StatusName = N'Failed';
 
             var keyMaps = dates.ToDictionary(x => x.ToString("yyyy-MM-dd-HH"), x => x);
 
-            return GetTimelineStats(connection, tableName, statusName, keyMaps);
+            return GetTimelineStats(tableName, statusName, keyMaps);
         }
 
         private Dictionary<DateTime, int> GetTimelineStats(
-            IDbConnection connection,
             string tableName,
             string statusName,
             IDictionary<string, DateTime> keyMaps)
@@ -170,8 +188,8 @@ select count(Id) from [{0}].Received with (nolock) where StatusName = N'Failed';
             var sqlQuery2008 = $@"
 with aggr as (
     select replace(convert(varchar, Added, 111), '/','-') + '-' + CONVERT(varchar, DATEPART(hh, Added)) as [Key],
-        count(id) [Count]
-    from  [{_options.Schema}].{tableName}
+        count(Id) [Count]
+    from  {tableName}
     where StatusName = @statusName
     group by replace(convert(varchar, Added, 111), '/','-') + '-' + CONVERT(varchar, DATEPART(hh, Added))
 )
@@ -181,24 +199,39 @@ select [Key], [Count] from aggr with (nolock) where [Key] in @keys;";
             var sqlQuery = $@"
 with aggr as (
     select FORMAT(Added,'yyyy-MM-dd-HH') as [Key],
-        count(id) [Count]
-    from  [{_options.Schema}].{tableName}
+        count(Id) [Count]
+    from  {tableName}
     where StatusName = @statusName
     group by FORMAT(Added,'yyyy-MM-dd-HH')
 )
-select [Key], [Count] from aggr with (nolock) where [Key] in @keys;";
+select [Key], [Count] from aggr with (nolock) where [Key] >= @minKey and [Key] <= @maxKey;";
 
-            var valuesMap = connection.Query<TimelineCounter>(
-                    _options.IsSqlServer2008 ? sqlQuery2008 : sqlQuery,
-                    new {keys = keyMaps.Keys, statusName})
-                .ToDictionary(x => x.Key, x => x.Count);
+            object[] sqlParams =
+            {
+                new SqlParameter("@statusName", statusName),
+                new SqlParameter("@minKey", keyMaps.Keys.Min()),
+                new SqlParameter("@maxKey", keyMaps.Keys.Max())
+            };
+
+            Dictionary<string, int> valuesMap;
+            using (var connection = new SqlConnection(_options.ConnectionString))
+            {
+                valuesMap = connection.ExecuteReader(_options.IsSqlServer2008 ? sqlQuery2008 : sqlQuery, reader =>
+                {
+                    var dictionary = new Dictionary<string, int>();
+
+                    while (reader.Read())
+                    {
+                        dictionary.Add(reader.GetString(0), reader.GetInt32(1));
+                    }
+
+                    return dictionary;
+                }, sqlParams);
+            }
 
             foreach (var key in keyMaps.Keys)
             {
-                if (!valuesMap.ContainsKey(key))
-                {
-                    valuesMap.Add(key, 0);
-                }
+                if (!valuesMap.ContainsKey(key)) valuesMap.Add(key, 0);
             }
 
             var result = new Dictionary<DateTime, int>();
@@ -210,5 +243,32 @@ select [Key], [Count] from aggr with (nolock) where [Key] in @keys;";
 
             return result;
         }
-    }
+
+        private async Task<MediumMessage> GetMessageAsync(string tableName, long id)
+        {
+            var sql = $@"SELECT TOP 1 Id AS DbId, Content, Added, ExpiresAt, Retries FROM {tableName} WITH (readpast) WHERE Id={id}";
+
+            using var connection = new SqlConnection(_options.ConnectionString);
+            var mediumMessage = connection.ExecuteReader(sql, reader =>
+            {
+                MediumMessage message = null;
+
+                while (reader.Read())
+                {
+                    message = new MediumMessage
+                    {
+                        DbId = reader.GetInt64(0).ToString(),
+                        Content = reader.GetString(1),
+                        Added = reader.GetDateTime(2),
+                        ExpiresAt = reader.GetDateTime(3),
+                        Retries = reader.GetInt32(4)
+                    };
+                }
+
+                return message;
+            });
+
+            return await Task.FromResult(mediumMessage);
+        }
+    } 
 }
